@@ -99,6 +99,10 @@ extern const char *f2fs_fault_name[FAULT_MAX];
 #define F2FS_MOUNT_DISABLE_CHECKPOINT	0x02000000
 #define F2FS_MOUNT_NORECOVERY		0x04000000
 
+#ifdef CONFIG_F2FS_RESERVE_SPACE_FILTER
+#define F2FS_RESERVE_BLOCKS		51200
+#endif
+
 #define F2FS_OPTION(sbi)	((sbi)->mount_opt)
 #define clear_opt(sbi, option)	(F2FS_OPTION(sbi).opt &= ~F2FS_MOUNT_##option)
 #define set_opt(sbi, option)	(F2FS_OPTION(sbi).opt |= F2FS_MOUNT_##option)
@@ -774,6 +778,9 @@ struct f2fs_inode_info {
 
 	/* Use below internally in f2fs*/
 	unsigned long flags[BITS_TO_LONGS(FI_MAX)];	/* use to pass per-file flags */
+#if BITS_PER_LONG == 32
+	unsigned long i_overflow;	/* fix for 32bit arch */
+#endif
 	struct rw_semaphore i_sem;	/* protect fi info */
 	atomic_t dirty_pages;		/* # of dirty pages */
 	f2fs_hash_t chash;		/* hash value of given file name */
@@ -1990,7 +1997,12 @@ static inline bool __allow_reserved_blocks(struct f2fs_sb_info *sbi,
 		return false;
 	if (IS_NOQUOTA(inode))
 		return true;
+#ifdef CONFIG_F2FS_RESERVE_SPACE_FILTER
+	if (uid_eq(F2FS_OPTION(sbi).s_resuid, current_fsuid()) ||
+			check_have_permission(0))
+#else
 	if (uid_eq(F2FS_OPTION(sbi).s_resuid, current_fsuid()))
+#endif
 		return true;
 	if (!gid_eq(F2FS_OPTION(sbi).s_resgid, GLOBAL_ROOT_GID) &&
 					in_group_p(F2FS_OPTION(sbi).s_resgid))

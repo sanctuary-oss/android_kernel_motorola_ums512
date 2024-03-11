@@ -14,6 +14,8 @@
 #include <linux/module.h>
 #include <linux/ftrace.h>
 
+#include <../../drivers/soc/sprd/debug/irq/eirqsoff/trace_eirqsoff.h>
+
 #include "trace.h"
 
 #define CREATE_TRACE_POINTS
@@ -456,6 +458,7 @@ EXPORT_SYMBOL_GPL(stop_critical_timings);
 #ifdef CONFIG_PROVE_LOCKING
 void time_hardirqs_on(unsigned long a0, unsigned long a1)
 {
+	stop_eirqsoff_timing(a0, a1);
 	if (!preempt_trace() && irq_trace())
 		stop_critical_timing(a0, a1);
 }
@@ -464,6 +467,7 @@ void time_hardirqs_off(unsigned long a0, unsigned long a1)
 {
 	if (!preempt_trace() && irq_trace())
 		start_critical_timing(a0, a1);
+	start_eirqsoff_timing(a0, a1);
 }
 
 #else /* !CONFIG_PROVE_LOCKING */
@@ -473,6 +477,8 @@ void time_hardirqs_off(unsigned long a0, unsigned long a1)
  */
 static inline void tracer_hardirqs_on(void)
 {
+	stop_irqsoff_panic_timing();
+	stop_eirqsoff_timing(CALLER_ADDR0, CALLER_ADDR1);
 	if (!preempt_trace() && irq_trace())
 		stop_critical_timing(CALLER_ADDR0, CALLER_ADDR1);
 }
@@ -481,10 +487,13 @@ static inline void tracer_hardirqs_off(void)
 {
 	if (!preempt_trace() && irq_trace())
 		start_critical_timing(CALLER_ADDR0, CALLER_ADDR1);
+	start_eirqsoff_timing(CALLER_ADDR0, CALLER_ADDR1);
+	start_irqsoff_panic_timing();
 }
 
 static inline void tracer_hardirqs_on_caller(unsigned long caller_addr)
 {
+	stop_eirqsoff_timing(CALLER_ADDR0, caller_addr);
 	if (!preempt_trace() && irq_trace())
 		stop_critical_timing(CALLER_ADDR0, caller_addr);
 }
@@ -493,6 +502,7 @@ static inline void tracer_hardirqs_off_caller(unsigned long caller_addr)
 {
 	if (!preempt_trace() && irq_trace())
 		start_critical_timing(CALLER_ADDR0, caller_addr);
+	start_eirqsoff_timing(CALLER_ADDR0, caller_addr);
 }
 
 #endif /* CONFIG_PROVE_LOCKING */
@@ -501,6 +511,7 @@ static inline void tracer_hardirqs_off_caller(unsigned long caller_addr)
 #ifdef CONFIG_PREEMPT_TRACER
 static inline void tracer_preempt_on(unsigned long a0, unsigned long a1)
 {
+	stop_epreempt_timing(a0, a1);
 	if (preempt_trace() && !irq_trace())
 		stop_critical_timing(a0, a1);
 }
@@ -509,6 +520,7 @@ static inline void tracer_preempt_off(unsigned long a0, unsigned long a1)
 {
 	if (preempt_trace() && !irq_trace())
 		start_critical_timing(a0, a1);
+	start_epreempt_timing(a0, a1);
 }
 #endif /* CONFIG_PREEMPT_TRACER */
 

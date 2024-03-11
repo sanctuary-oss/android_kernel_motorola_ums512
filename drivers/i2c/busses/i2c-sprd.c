@@ -12,6 +12,7 @@
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
@@ -86,7 +87,9 @@ struct sprd_i2c {
 	u32 count;
 	int irq;
 	int err;
+	bool polling;
 	bool is_suspended;
+	int (*handle_msg)(struct i2c_adapter *, struct i2c_msg *, int);
 };
 
 static void sprd_i2c_set_count(struct sprd_i2c *i2c_dev, u32 count)
@@ -193,6 +196,108 @@ static void sprd_i2c_set_fifo_empty_int(struct sprd_i2c *i2c_dev, int enable)
 	writel(tmp, i2c_dev->base + I2C_CTL);
 };
 
+static int sprd_i2c_wait_nobusy(struct sprd_i2c *i2c_dev, u32 timeout)
+{
+	u32 status;
+
+	do {
+		status = readl(i2c_dev->base + I2C_STATUS);
+		if (!(status & I2C_BUSY))
+			break;
+		udelay(1);
+	} while (--timeout);
+
+	if (timeout == 0) {
+		dev_err(i2c_dev->dev,"i2c_wait_nobuzy timeout!\n");
+		return -ETIMEDOUT;
+	}
+	return 0;
+}
+
+static int sprd_i2c_wait_nobusy_nack(struct sprd_i2c *i2c_dev, u32 timeout)
+{
+	int nack = 0;
+	u32 status;
+	do {
+		status = readl(i2c_dev->base + I2C_STATUS);
+		if (!(status & I2C_BUSY))
+			break;
+
+		if (status & I2C_RX_ACK) {
+			nack = 1;
+			break;
+		}
+		udelay(1);
+	} while (--timeout);
+
+	if (nack) {
+		dev_err(i2c_dev->dev, "i2c_wait nack!\n");
+		return -EIO;
+	}
+	if (timeout == 0) {
+		dev_err(i2c_dev->dev, "i2c_wait nobuzy timeout!\n");
+		return -ETIMEDOUT;
+	}
+	return 0;
+}
+
+static int sprd_i2c_polling_status(struct sprd_i2c *i2c_dev, u32 timeout,
+				   u32 polling_sts)
+{
+	u32 status;
+
+	do {
+		status = readl(i2c_dev->base + I2C_STATUS);
+		if (status & polling_sts)
+			break;
+		udelay(1);
+	} while (--timeout);
+
+	if (timeout == 0) {
+		dev_err(i2c_dev->dev, "wait status:%u timeout!\n", polling_sts);
+		return -ETIMEDOUT;
+	}
+	return 0;
+}
+
+static int sprd_i2c_wait_busy(struct sprd_i2c *i2c_dev, u32 timeout)
+{
+	return sprd_i2c_polling_status(i2c_dev, timeout, I2C_BUSY);
+}
+
+static int sprd_i2c_wait_for_fifofull(struct sprd_i2c *i2c_dev, u32 timeout)
+{
+	return sprd_i2c_polling_status(i2c_dev, timeout, FIFO_FULL);
+}
+
+
+static int sprd_i2c_wait_for_fifoempty_nack(struct sprd_i2c *i2c_dev, u32 timeout)
+{
+	int nack = 0;
+	u32 status;
+	do {
+		status = readl(i2c_dev->base + I2C_STATUS);
+		if (status & FIFO_EMPTY)
+			break;
+
+		if (status & I2C_RX_ACK) {
+			nack = 1;
+			break;
+		}
+		udelay(1);
+	} while (--timeout);
+	if (nack) {
+		dev_err(i2c_dev->dev, "wait_for_fifoempty_nack nack!\n");
+		return -EIO;
+	}
+
+	if (timeout == 0) {
+		dev_err(i2c_dev->dev,"wait_for_fifoempty_nack timeout!\n");
+		return -ETIMEDOUT;
+	}
+	return 0;
+}
+
 static void sprd_i2c_opt_start(struct sprd_i2c *i2c_dev)
 {
 	u32 tmp = readl(i2c_dev->base + I2C_CTL);
@@ -205,6 +310,136 @@ static void sprd_i2c_opt_mode(struct sprd_i2c *i2c_dev, int rw)
 	u32 cmd = readl(i2c_dev->base + I2C_CTL) & ~I2C_MODE;
 
 	writel(cmd | rw << 3, i2c_dev->base + I2C_CTL);
+}
+
+static int sprd_i2c_read_data(struct sprd_i2c *i2c_dev)
+{
+	u32 len;
+	int ret;
+
+	if (!i2c_dev->buf)
+		return -EINVAL;
+
+	/*
+	 * The master has sent a start signal, waiting for the bus to prepare
+	 * Wait for 1byte transmission time
+	 */
+	ret = sprd_i2c_wait_busy(i2c_dev, 100);
+	if (ret != 0) {
+		dev_err(i2c_dev->dev, "read_data not start!!\n");
+		goto exit;
+	}
+
+	while (i2c_dev->count) {
+		len = i2c_dev->count < I2C_FIFO_FULL_THLD ? i2c_dev->count :
+			I2C_FIFO_FULL_THLD;
+
+		if (len == i2c_dev->count) {
+
+			/*
+			 * UI = 1 / frequency,if frequency = 100K, UI = 10us
+			 * transfer one fifo length data, 16byte
+			 * timeout = 16 * 9 * UI
+			 */
+			ret = sprd_i2c_wait_nobusy(i2c_dev, 2000);
+			if (ret != 0)
+				break;
+		} else {
+			ret = sprd_i2c_wait_for_fifofull(i2c_dev, 2000);
+			if (ret != 0)
+				break;
+		}
+		sprd_i2c_read_bytes(i2c_dev, i2c_dev->buf, len);
+		i2c_dev->count -= len;
+		i2c_dev->buf += len;
+	}
+exit:
+	sprd_i2c_clear_ack(i2c_dev);
+	sprd_i2c_clear_irq(i2c_dev);
+	return ret;
+}
+
+static int sprd_i2c_write_data(struct sprd_i2c *i2c_dev)
+{
+	bool restart = false;
+	u32 len;
+	int ret;
+
+	/*
+	 * UI = 1 / frequency,if frequency = 100K, UI = 10us
+	 * transfer one fifo length data, 16byte
+	 * timeout = 16 * 9 * UI
+	 */
+	ret = sprd_i2c_wait_nobusy(i2c_dev, 2000);
+	if (ret != 0) {
+		dev_err(i2c_dev->dev, "write_data not start!!\n");
+		goto exit;
+	}
+
+	while (i2c_dev->count) {
+		len = i2c_dev->count < I2C_FIFO_DEEP ? i2c_dev->count :
+			I2C_FIFO_DEEP;
+		sprd_i2c_write_bytes(i2c_dev, i2c_dev->buf, len);
+		if (!restart) {
+			sprd_i2c_opt_start(i2c_dev);
+			restart = true;
+		}
+
+		if (len == i2c_dev->count) {
+
+			/*
+			* UI = 1 / frequency,if frequency = 100K, UI = 10us
+			* transfer one fifo length data, 16byte
+			* timeout = 16 * 9 * UI
+			*/
+			ret = sprd_i2c_wait_nobusy_nack(i2c_dev, 2000);
+			if (ret)
+				break;
+		} else {
+			ret = sprd_i2c_wait_for_fifoempty_nack(i2c_dev, 2000);
+			if (ret)
+				break;
+		}
+		i2c_dev->count -= len;
+		i2c_dev->buf += len;
+	}
+exit:
+	sprd_i2c_clear_ack(i2c_dev);
+	sprd_i2c_clear_irq(i2c_dev);
+	return ret;
+}
+
+static int sprd_i2c_polling_handle_msg(struct i2c_adapter *i2c_adap,
+			struct i2c_msg *pmsg, int is_last_msg)
+{
+	struct sprd_i2c *i2c_dev = i2c_adap->algo_data;
+	int ret;
+
+	i2c_dev->msg = pmsg;
+	i2c_dev->buf = pmsg->buf;
+	i2c_dev->count = pmsg->len;
+
+	sprd_i2c_reset_fifo(i2c_dev);
+	sprd_i2c_set_devaddr(i2c_dev, pmsg);
+	sprd_i2c_set_count(i2c_dev, pmsg->len);
+
+	if (pmsg->flags & I2C_M_RD) {
+		sprd_i2c_opt_mode(i2c_dev, 1);
+		sprd_i2c_send_stop(i2c_dev, 1);
+	} else {
+		sprd_i2c_opt_mode(i2c_dev, 0);
+		sprd_i2c_send_stop(i2c_dev, !!is_last_msg);
+	}
+
+	if (pmsg->flags & I2C_M_RD) {
+		sprd_i2c_opt_start(i2c_dev);
+		ret = sprd_i2c_read_data(i2c_dev);
+	} else {
+		ret = sprd_i2c_write_data(i2c_dev);
+	}
+	sprd_i2c_clear_start(i2c_dev);
+
+	return ret;
 }
 
 static void sprd_i2c_data_transfer(struct sprd_i2c *i2c_dev)
@@ -241,7 +476,7 @@ static void sprd_i2c_data_transfer(struct sprd_i2c *i2c_dev)
 }
 
 static int sprd_i2c_handle_msg(struct i2c_adapter *i2c_adap,
-			       struct i2c_msg *msg, bool is_last_msg)
+			       struct i2c_msg *msg, int is_last_msg)
 {
 	struct sprd_i2c *i2c_dev = i2c_adap->algo_data;
 
@@ -292,12 +527,12 @@ static int sprd_i2c_master_xfer(struct i2c_adapter *i2c_adap,
 		return ret;
 
 	for (im = 0; im < num - 1; im++) {
-		ret = sprd_i2c_handle_msg(i2c_adap, &msgs[im], 0);
+		ret = i2c_dev->handle_msg(i2c_adap, &msgs[im], im == num - 1);
 		if (ret)
 			goto err_msg;
 	}
 
-	ret = sprd_i2c_handle_msg(i2c_adap, &msgs[im++], 1);
+	ret = i2c_dev->handle_msg(i2c_adap, &msgs[im++], 1);
 
 err_msg:
 	pm_runtime_mark_last_busy(i2c_dev->dev);
@@ -344,6 +579,9 @@ static void sprd_i2c_set_clk(struct sprd_i2c *i2c_dev, u32 freq)
 		writel((6 * apb_clk) / 10000000, i2c_dev->base + ADDR_STA0_DVD);
 	else if (freq == 100000)
 		writel((4 * apb_clk) / 1000000, i2c_dev->base + ADDR_STA0_DVD);
+	else if (freq == 1000000)
+		writel((8 * apb_clk) / 10000000, i2c_dev->base + ADDR_STA0_DVD);
+
 }
 
 static void sprd_i2c_enable(struct sprd_i2c *i2c_dev)
@@ -469,9 +707,10 @@ static int sprd_i2c_clk_init(struct sprd_i2c *i2c_dev)
 
 	i2c_dev->clk = devm_clk_get(i2c_dev->dev, "enable");
 	if (IS_ERR(i2c_dev->clk)) {
-		dev_warn(i2c_dev->dev, "i2c%d can't get the enable clock\n",
-			 i2c_dev->adap.nr);
-		i2c_dev->clk = NULL;
+		if (PTR_ERR(i2c_dev->clk) != -EPROBE_DEFER)
+			dev_err(i2c_dev->dev, "i2c%d can't get the enable clock\n",
+				i2c_dev->adap.nr);
+		return PTR_ERR(i2c_dev->clk);
 	}
 
 	return 0;
@@ -517,14 +756,23 @@ static int sprd_i2c_probe(struct platform_device *pdev)
 	i2c_dev->adap.nr = pdev->id;
 	i2c_dev->adap.dev.of_node = dev->of_node;
 
+	i2c_dev->polling = of_property_read_bool(pdev->dev.of_node, "sprd,polling");
+	if (i2c_dev->polling)
+		i2c_dev->handle_msg = sprd_i2c_polling_handle_msg;
+	else
+		i2c_dev->handle_msg = sprd_i2c_handle_msg;
+
 	if (!of_property_read_u32(dev->of_node, "clock-frequency", &prop))
 		i2c_dev->bus_freq = prop;
 
-	/* We only support 100k and 400k now, otherwise will return error. */
-	if (i2c_dev->bus_freq != 100000 && i2c_dev->bus_freq != 400000)
+	/* We only support 100k、400k and 1M now, otherwise will return error. */
+	if (i2c_dev->bus_freq != 100000 && i2c_dev->bus_freq != 400000 &&
+		i2c_dev->bus_freq != 1000000)
 		return -EINVAL;
 
-	sprd_i2c_clk_init(i2c_dev);
+	ret = sprd_i2c_clk_init(i2c_dev);
+	if (ret)
+		return ret;
 	platform_set_drvdata(pdev, i2c_dev);
 
 	ret = clk_prepare_enable(i2c_dev->clk);
@@ -542,13 +790,15 @@ static int sprd_i2c_probe(struct platform_device *pdev)
 	if (ret < 0)
 		goto err_rpm_put;
 
-	ret = devm_request_threaded_irq(dev, i2c_dev->irq,
-		sprd_i2c_isr, sprd_i2c_isr_thread,
-		IRQF_NO_SUSPEND | IRQF_ONESHOT,
-		pdev->name, i2c_dev);
-	if (ret) {
-		dev_err(&pdev->dev, "failed to request irq %d\n", i2c_dev->irq);
-		goto err_rpm_put;
+	if (!i2c_dev->polling) {
+		ret = devm_request_threaded_irq(&pdev->dev, i2c_dev->irq,
+			sprd_i2c_isr, sprd_i2c_isr_thread,
+			IRQF_NO_SUSPEND | IRQF_ONESHOT,
+			pdev->name, i2c_dev);
+		if (ret) {
+			dev_err(&pdev->dev, "failure requesting irq %i\n", i2c_dev->irq);
+			goto err_rpm_put;
+		}
 	}
 
 	ret = i2c_add_numbered_adapter(&i2c_dev->adap);
@@ -641,6 +891,14 @@ static const struct dev_pm_ops sprd_i2c_pm_ops = {
 
 static const struct of_device_id sprd_i2c_of_match[] = {
 	{ .compatible = "sprd,sc9860-i2c", },
+	{ .compatible = "sprd,sharkl5-i2c", },
+	{ .compatible = "sprd,roc1-i2c", },
+	{ .compatible = "sprd,sharkl3-i2c", },
+	{ .compatible = "sprd,orca-i2c", },
+	{ .compatible = "sprd,sharkl5pro-i2c", },
+	{ .compatible = "sprd,sharkle-i2c", },
+	{ .compatible = "sprd,pike2-i2c", },
+	{ .compatible = "sprd,qogirl6-i2c", },
 	{},
 };
 
@@ -654,8 +912,4 @@ static struct platform_driver sprd_i2c_driver = {
 	},
 };
 
-static int sprd_i2c_init(void)
-{
-	return platform_driver_register(&sprd_i2c_driver);
-}
-arch_initcall_sync(sprd_i2c_init);
+module_platform_driver(sprd_i2c_driver);

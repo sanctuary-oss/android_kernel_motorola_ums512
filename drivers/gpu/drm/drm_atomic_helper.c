@@ -666,9 +666,9 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 		if (ret != 0)
 			return ret;
 
-		ret = drm_atomic_add_affected_planes(state, crtc);
+		/*ret = drm_atomic_add_affected_planes(state, crtc);
 		if (ret != 0)
-			return ret;
+			return ret;*/
 	}
 
 	/*
@@ -1172,9 +1172,12 @@ int drm_atomic_helper_wait_for_fences(struct drm_device *dev,
 		 * still interrupt the operation. Instead of blocking until the
 		 * timer expires, make the wait interruptible.
 		 */
-		ret = dma_fence_wait(new_plane_state->fence, pre_swap);
-		if (ret)
-			return ret;
+		ret = dma_fence_wait_timeout(new_plane_state->fence, pre_swap,
+			msecs_to_jiffies(3000));
+		if (ret == 0)
+			DRM_ERROR("wait fence timed out, index:%d,\n", i);
+		else if (ret < 0)
+			DRM_ERROR("wait fence failed, index:%d, ret:%d.\n", i, ret);
 
 		dma_fence_put(new_plane_state->fence);
 		new_plane_state->fence = NULL;

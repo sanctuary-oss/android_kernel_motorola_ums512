@@ -264,8 +264,13 @@ static int f2fs_sb_read_encoding(const struct f2fs_super_block *sb,
 
 static inline void limit_reserve_root(struct f2fs_sb_info *sbi)
 {
+#ifdef CONFIG_F2FS_RESERVE_SPACE_FILTER
+	/* limit is 2% */
+	block_t limit = (sbi->user_block_count << 1) / 100;
+#else
 	block_t limit = min((sbi->user_block_count << 1) / 1000,
 			sbi->user_block_count - sbi->reserved_blocks);
+#endif
 
 	/* limit is 0.2% */
 	if (test_opt(sbi, RESERVE_ROOT) &&
@@ -929,6 +934,10 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 			return -EINVAL;
 		}
 	}
+#ifdef CONFIG_F2FS_RESERVE_SPACE_FILTER
+	F2FS_OPTION(sbi).root_reserved_blocks = F2FS_RESERVE_BLOCKS;
+	set_opt(sbi, RESERVE_ROOT);
+#endif
 #ifdef CONFIG_QUOTA
 	if (f2fs_check_quota_options(sbi))
 		return -EINVAL;

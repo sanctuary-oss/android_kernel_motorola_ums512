@@ -50,6 +50,10 @@
 
 #include <asm/mman.h>
 
+#ifdef CONFIG_PROTECT_LRU
+#include <linux/protect_lru.h>
+#endif
+
 /*
  * Shared mappings implemented 30.11.1994. It's not fully working yet,
  * though.
@@ -759,6 +763,14 @@ static int __add_to_page_cache_locked(struct page *page,
 
 	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(PageSwapBacked(page), page);
+
+#ifdef CONFIG_PROTECT_LRU
+	/* To tell memcgroup this page is protected,
+	 * so it should be resided in root_mem_cgroup.
+	 */
+	if (current->mm && current->mm->protect > 0)
+		gfp_mask |= __GFP_PROTECT_LRU;
+#endif
 
 	if (!huge) {
 		error = mem_cgroup_try_charge(page, current->mm,
@@ -1541,7 +1553,11 @@ no_page:
 			unlock_page(page);
 	}
 
+#ifdef CONFIG_PROTECT_LRU
+	return protect_lru_move_and_shrink(page);
+#else
 	return page;
+#endif
 }
 EXPORT_SYMBOL(pagecache_get_page);
 
@@ -2399,13 +2415,16 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	/* If we don't want any read-ahead, don't bother */
 	if (vmf->vma->vm_flags & VM_RAND_READ)
 		return fpin;
-	if (!ra->ra_pages)
+	if (!RA_PAGES(ra))
 		return fpin;
+
+	/* sync ra->ra_pages with bdi->ra_pages*/
+	ra_pages_sync(ra, mapping);
 
 	if (vmf->vma->vm_flags & VM_SEQ_READ) {
 		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
 		page_cache_sync_readahead(mapping, ra, file, offset,
-					  ra->ra_pages);
+					  RA_PAGES(ra));
 		return fpin;
 	}
 
@@ -2424,9 +2443,9 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	 * mmap read-around
 	 */
 	fpin = maybe_unlock_mmap_for_io(vmf, fpin);
-	ra->start = max_t(long, 0, offset - ra->ra_pages / 2);
-	ra->size = ra->ra_pages;
-	ra->async_size = ra->ra_pages / 4;
+	ra->start = max_t(long, 0, offset - RA_PAGES(ra) / 2);
+	ra->size = RA_PAGES(ra);
+	ra->async_size = RA_PAGES(ra) / 4;
 	ra_submit(ra, mapping, file);
 	return fpin;
 }
@@ -2445,6 +2464,9 @@ static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
 	struct file *fpin = NULL;
 	pgoff_t offset = vmf->pgoff;
 
+	/* sync ra->ra_pages with bdi->ra_pages*/
+	ra_pages_sync(ra, mapping);
+
 	/* If we don't want any read-ahead, don't bother */
 	if (vmf->vma->vm_flags & VM_RAND_READ)
 		return fpin;
@@ -2453,7 +2475,7 @@ static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
 	if (PageReadahead(page)) {
 		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
 		page_cache_async_readahead(mapping, ra, file,
-					   page, offset, ra->ra_pages);
+					   page, offset, RA_PAGES(ra));
 	}
 	return fpin;
 }
